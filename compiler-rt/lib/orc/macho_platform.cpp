@@ -116,28 +116,38 @@ struct UnwindSectionInfo {
   std::vector<ExecutorAddrRange> CodeRanges;
   ExecutorAddrRange DwarfSection;
   ExecutorAddrRange CompactUnwindSection;
+  // Per-graph dso-base: address of `__jitlink$libunwind_dso_base`
+  // anchored in the graph's own `__TEXT,__lcl_macho_hdr`. This is the
+  // base CompactUnwindManager used when writing the graph's
+  // `__unwind_info`; libunwind must decode personality offsets from
+  // it, so we stash it per PC range and return it as `dso_base` from
+  // `lookupUnwindSections`.
+  ExecutorAddr DsoBase;
 };
 
 using SPSUnwindSectionInfo =
     SPSTuple<SPSSequence<SPSExecutorAddrRange>, SPSExecutorAddrRange,
-             SPSExecutorAddrRange>;
+             SPSExecutorAddrRange, SPSExecutorAddr>;
 
 template <>
 class SPSSerializationTraits<SPSUnwindSectionInfo, UnwindSectionInfo> {
 public:
   static size_t size(const UnwindSectionInfo &USI) {
     return SPSUnwindSectionInfo::AsArgList::size(
-        USI.CodeRanges, USI.DwarfSection, USI.CompactUnwindSection);
+        USI.CodeRanges, USI.DwarfSection, USI.CompactUnwindSection,
+        USI.DsoBase);
   }
 
   static bool serialize(SPSOutputBuffer &OB, const UnwindSectionInfo &USI) {
     return SPSUnwindSectionInfo::AsArgList::serialize(
-        OB, USI.CodeRanges, USI.DwarfSection, USI.CompactUnwindSection);
+        OB, USI.CodeRanges, USI.DwarfSection, USI.CompactUnwindSection,
+        USI.DsoBase);
   }
 
   static bool deserialize(SPSInputBuffer &IB, UnwindSectionInfo &USI) {
     return SPSUnwindSectionInfo::AsArgList::deserialize(
-        IB, USI.CodeRanges, USI.DwarfSection, USI.CompactUnwindSection);
+        IB, USI.CodeRanges, USI.DwarfSection, USI.CompactUnwindSection,
+        USI.DsoBase);
   }
 };
 
@@ -172,10 +182,18 @@ private:
   struct UnwindSections {
     UnwindSections(const UnwindSectionInfo &USI)
         : DwarfSection(USI.DwarfSection.toSpan<char>()),
-          CompactUnwindSection(USI.CompactUnwindSection.toSpan<char>()) {}
+          CompactUnwindSection(USI.CompactUnwindSection.toSpan<char>()),
+          DsoBase(USI.DsoBase) {}
 
     span<char> DwarfSection;
     span<char> CompactUnwindSection;
+    // Per-graph dso-base; returned as `unw_dynamic_unwind_sections::dso_base`
+    // from `lookupUnwindSections`. Keeping it per PC range (rather than
+    // per JITDylib on `JITDylibState::Header`) lets us match the
+    // per-graph local MachO header that CompactUnwindManager used when
+    // writing `__unwind_info`, which is required for libunwind to
+    // decode personality offsets correctly.
+    ExecutorAddr DsoBase;
   };
 
   using UnwindSectionsMap =
@@ -968,7 +986,15 @@ bool MachOPlatformRuntimeState::lookupUnwindSections(
     auto &JD = KV.second;
     auto I = JD.UnwindSections.find(reinterpret_cast<char *>(Addr));
     if (I != JD.UnwindSections.end()) {
-      Info.dso_base = reinterpret_cast<uintptr_t>(JD.Header);
+      // Use the per-graph dso-base that CompactUnwindManager baked
+      // into `__unwind_info` rather than `JD.Header`. `JD.Header` kept
+      // its role as the JITDylib identity for bookkeeping (see
+      // `getJITDylibStateByHeader`), but the writer now uses a
+      // per-graph `__TEXT,__lcl_macho_hdr` as the compact-unwind base,
+      // so libunwind must decode personality offsets against that same
+      // base or it would read garbage.
+      Info.dso_base =
+          reinterpret_cast<uintptr_t>(I->second.DsoBase.toPtr<void *>());
       Info.dwarf_section =
           reinterpret_cast<uintptr_t>(I->second.DwarfSection.data());
       Info.dwarf_section_length = I->second.DwarfSection.size();

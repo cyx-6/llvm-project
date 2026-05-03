@@ -834,12 +834,25 @@ void MachOPlatform::MachOPlatformPlugin::modifyPassConfig(
     if (auto *CUSec = LG.findSectionByName(MachOCompactUnwindSectionName))
       LG.removeSection(*CUSec);
 
-  // Point the libunwind dso-base absolute symbol at the header for the
-  // JITDylib. This will prevent us from synthesizing a new header for
-  // every object.
-  if (HeaderAddr)
-    LG.addAbsoluteSymbol("__jitlink$libunwind_dso_base", HeaderAddr, 0,
-                         Linkage::Strong, Scope::Local, true);
+  // Note: we deliberately do NOT inject `__jitlink$libunwind_dso_base`
+  // as an absolute symbol pointing at the JITDylib header here. Doing
+  // so would make `CompactUnwindManager::writePersonalities` (and the
+  // three sibling writers in CompactUnwindSupport.h) compute deltas
+  // from an address that lives in a *separate* JITLinkMemoryManager
+  // allocation from the user graph's own slab -- two independent mmaps
+  // with no ordering guarantee. When the user graph is placed at a
+  // lower virtual address than the header, the uint64_t delta
+  // `personality - header` wraps past 2^32 and `isUInt<32>` rejects
+  // the link. Falling through to `getOrCreateLocalMachOHeader`
+  // (`getOrCreateCompactUnwindBase` in CompactUnwindSupport.h) anchors
+  // a per-graph `__TEXT,__lcl_macho_hdr` as the compact-unwind base;
+  // within a single graph `BasicLayout::segments()` lays R -> RW -> RX
+  // in ascending addresses, so the base is always the lowest address
+  // and the `uint32_t` personality deltas stay non-negative. The
+  // corresponding per-graph address is propagated to the ORC runtime
+  // via the new `DsoBase` field on `UnwindSectionInfo` (see below) so
+  // libunwind decodes personality offsets against the same base the
+  // writer used.
 
   // If we're in the bootstrap phase then increment the active graphs.
   if (LLVM_UNLIKELY(InBootstrapPhase))
@@ -1313,6 +1326,17 @@ MachOPlatform::MachOPlatformPlugin::findUnwindSectionInfo(
             CodeBlocks.push_back(&E.getTarget().getBlock());
           }
         });
+
+    // CompactUnwindManager::processAndReserveUnwindInfo (a PostPrune
+    // pass) has already defined `__jitlink$libunwind_dso_base` as a
+    // local symbol anchored at the per-graph `__TEXT,__lcl_macho_hdr`
+    // section by the time this PostAllocation pass runs. Capture that
+    // address so we can forward it to the ORC runtime; libunwind will
+    // decode personality offsets from `__unwind_info` against it, so
+    // writer and runtime have to agree.
+    auto DsoBaseName = G.intern("__jitlink$libunwind_dso_base");
+    if (auto *DsoBaseSym = G.findDefinedSymbolByName(DsoBaseName))
+      US.DsoBase = DsoBaseSym->getAddress();
   }
 
   // If we didn't find any pointed-to code-blocks then there's no need to
@@ -1413,12 +1437,19 @@ Error MachOPlatform::MachOPlatformPlugin::registerObjectPlatformSections(
     MachOPlatformSecs.push_back({SecName, R.getRange()});
   }
 
+  // The SPS wire type carries, in order:
+  //   CodeRanges, DwarfSection, CompactUnwindSection, DsoBase.
+  // DsoBase is the per-graph `__jitlink$libunwind_dso_base` address
+  // (see findUnwindSectionInfo). The runtime needs this so it can
+  // return it to libunwind as `dso_base` for this PC range; `JD.Header`
+  // is no longer sufficient because the writer uses the per-graph
+  // local header as the compact-unwind base.
   std::optional<std::tuple<SmallVector<ExecutorAddrRange>, ExecutorAddrRange,
-                           ExecutorAddrRange>>
+                           ExecutorAddrRange, ExecutorAddr>>
       UnwindInfo;
   if (auto UI = findUnwindSectionInfo(G))
     UnwindInfo = std::make_tuple(std::move(UI->CodeRanges), UI->DwarfSection,
-                                 UI->CompactUnwindSection);
+                                 UI->CompactUnwindSection, UI->DsoBase);
 
   if (!MachOPlatformSecs.empty() || UnwindInfo) {
     // Dump the scraped inits.
@@ -1432,7 +1463,8 @@ Error MachOPlatform::MachOPlatformPlugin::registerObjectPlatformSections(
     using SPSRegisterObjectPlatformSectionsArgs = SPSArgList<
         SPSExecutorAddr,
         SPSOptional<SPSTuple<SPSSequence<SPSExecutorAddrRange>,
-                             SPSExecutorAddrRange, SPSExecutorAddrRange>>,
+                             SPSExecutorAddrRange, SPSExecutorAddrRange,
+                             SPSExecutorAddr>>,
         SPSSequence<SPSTuple<SPSString, SPSExecutorAddrRange>>>;
 
     AllocActionCallPair AllocActions = {

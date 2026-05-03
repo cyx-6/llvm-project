@@ -244,6 +244,14 @@ private:
       SmallVector<ExecutorAddrRange> CodeRanges;
       ExecutorAddrRange DwarfSection;
       ExecutorAddrRange CompactUnwindSection;
+      // Per-graph dso-base: address of the `__jitlink$libunwind_dso_base`
+      // symbol anchored inside the user graph's own slab (the
+      // `__TEXT,__lcl_macho_hdr` section created by
+      // `getOrCreateLocalMachOHeader`). This is the base that
+      // CompactUnwindManager actually used when writing
+      // `__TEXT,__unwind_info`, so the runtime must hand libunwind the
+      // same value as `unw_dynamic_unwind_sections::dso_base`.
+      ExecutorAddr DsoBase;
     };
 
     struct ObjCImageInfo {
